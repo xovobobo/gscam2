@@ -290,12 +290,16 @@ bool GSCamNode::impl::create_pipeline()
     RCLCPP_INFO(node_->get_logger(), "Stream is paused");
   }
 
-  cinfo_pub_ = node_->create_publisher<sensor_msgs::msg::CameraInfo>("camera_info", 1);
+  auto qos_options = rclcpp::PublisherOptions();
+  qos_options.qos_overriding_options = rclcpp::QosOverridingOptions::with_default_policies();
+  auto qos = rclcpp::QoS(1);
+
+  cinfo_pub_ = node_->create_publisher<sensor_msgs::msg::CameraInfo>("camera_info", qos, qos_options);
   if (cxt_.image_encoding_ == "jpeg") {
     jpeg_pub_ =
-      node_->create_publisher<sensor_msgs::msg::CompressedImage>("image_raw/compressed", 1);
+      node_->create_publisher<sensor_msgs::msg::CompressedImage>("image_raw/compressed", qos, qos_options);
   } else {
-    camera_pub_ = node_->create_publisher<sensor_msgs::msg::Image>("image_raw", 1);
+    camera_pub_ = node_->create_publisher<sensor_msgs::msg::Image>("image_raw", qos, qos_options);
   }
 
   // Pre-roll camera if needed
