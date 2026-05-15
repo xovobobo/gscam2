@@ -108,6 +108,8 @@ ros2 run gscam2 gscam_main  --ros-args -p gst_plugin_path:="/home/me/myplugins"
 | `camera_name` | string | | Replaces `${NAME}` in the URL  |
 | `frame_id` | string | camera_frame | Camera frame ID |
 | `skip` | int | 0 | Skip n frames for each frame sent; useful for reducing frame rates |
+| `startup_timeout_sec` | double | 0.0 | Maximum time to wait (in seconds) for the first frame during startup; 0.0 means infinite |
+| `stream_timeout_sec_` | double | 0.0 | Timeout (in seconds) between frames before exiting; 0.0 means disabled |
 
 ## Topics
 - `camera_info`
