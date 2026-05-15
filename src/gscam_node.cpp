@@ -3,7 +3,11 @@
 extern "C" {
 #include "gst/gst.h"
 #include "gst/app/gstappsink.h"
+#include "gst/gstbus.h"
 }
+
+#include <chrono>
+#include <thread>
 
 #include "camera_info_manager/camera_info_manager.hpp"
 #include "sensor_msgs/image_encodings.hpp"
@@ -29,6 +33,8 @@ struct GSCamContext
   std::string camera_name_;       // Camera name
   std::string frame_id_;          // Camera frame id
   int64_t skip_{};                // Skip n frames, then send 1
+  double startup_timeout_sec_{};  // Max wait for first frame; 0 = wait indefinitely
+  double stream_timeout_sec_{};   // Max gap between frames; 0 = disable stall check
 
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr
     on_set_parameters_callback_handle_;
@@ -49,6 +55,7 @@ class GSCamNode::impl
   // Gstreamer structures
   GstElement * pipeline_;
   GstElement * sink_;
+  GstBus * bus_;
 
   // We need to poll GStreamer to get data
   // Move this to its own thread to avoid blocking or slowing down the rclcpp::spin() thread
@@ -66,6 +73,10 @@ class GSCamNode::impl
 
   // Counter used to implement the 'skip' parameter
   int64_t skip_count_;
+
+  // Stream health: detect stall when bus stays silent (common with RTSP)
+  bool got_first_frame_{false};
+  std::chrono::steady_clock::time_point last_frame_time_{};
 
   // Publish images...
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr camera_pub_;
@@ -85,6 +96,12 @@ class GSCamNode::impl
   // Process one frame
   void process_frame();
 
+  void poll_bus();
+  void handle_bus_message(GstMessage * msg);
+  bool wait_for_first_frame();
+  bool check_stream_stall();
+  void mark_frame_received();
+
 public:
   // Parameters
   GSCamContext cxt_;
@@ -95,6 +112,7 @@ public:
     camera_info_manager_(node),
     pipeline_(nullptr),
     sink_(nullptr),
+    bus_(nullptr),
     stop_signal_(false),
     shutdown_signal_(false),
     width_(0),
@@ -257,9 +275,15 @@ bool GSCamNode::impl::create_pipeline()
   time_offset_ = node_->now().nanoseconds() - ct;
   RCLCPP_INFO(node_->get_logger(), "Time offset: %ld", time_offset_);
 
+  bus_ = gst_element_get_bus(pipeline_);
+  if (!bus_) {
+    RCLCPP_WARN(node_->get_logger(), "Could not get GStreamer bus for pipeline");
+  }
+
   gst_element_set_state(pipeline_, GST_STATE_PAUSED);
 
-  if (gst_element_get_state(pipeline_, nullptr, nullptr, -1) == GST_STATE_CHANGE_FAILURE) {
+  if (gst_element_get_state(pipeline_, nullptr, nullptr, 5 * GST_SECOND) == GST_STATE_CHANGE_FAILURE) {
+    poll_bus();
     RCLCPP_FATAL(node_->get_logger(), "Failed to pause stream, check gscam_config");
     return false;
   } else {
@@ -279,7 +303,8 @@ bool GSCamNode::impl::create_pipeline()
     // The PAUSE, PLAY, PAUSE, PLAY cycle is to ensure proper pre-roll
     // I am told this is needed and am erring on the side of caution.
     gst_element_set_state(pipeline_, GST_STATE_PLAYING);
-    if (gst_element_get_state(pipeline_, nullptr, nullptr, -1) == GST_STATE_CHANGE_FAILURE) {
+    if (gst_element_get_state(pipeline_, nullptr, nullptr, 5 * GST_SECOND) == GST_STATE_CHANGE_FAILURE) {
+      poll_bus();
       RCLCPP_ERROR(node_->get_logger(), "Failed to play in preroll");
       return false;
     } else {
@@ -287,7 +312,8 @@ bool GSCamNode::impl::create_pipeline()
     }
 
     gst_element_set_state(pipeline_, GST_STATE_PAUSED);
-    if (gst_element_get_state(pipeline_, nullptr, nullptr, -1) == GST_STATE_CHANGE_FAILURE) {
+    if (gst_element_get_state(pipeline_, nullptr, nullptr, 5 * GST_SECOND) == GST_STATE_CHANGE_FAILURE) {
+      poll_bus();
       RCLCPP_ERROR(node_->get_logger(), "failed to pause in preroll");
       return false;
     } else {
@@ -296,6 +322,7 @@ bool GSCamNode::impl::create_pipeline()
   }
 
   if (gst_element_set_state(pipeline_, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+    poll_bus();
     RCLCPP_ERROR(node_->get_logger(), "Could not start stream!");
     return false;
   }
@@ -304,8 +331,175 @@ bool GSCamNode::impl::create_pipeline()
   return true;
 }
 
+void GSCamNode::impl::poll_bus()
+{
+  if (!bus_) {
+    return;
+  }
+
+  const GstMessageType types = static_cast<GstMessageType>(
+    GST_MESSAGE_ERROR | GST_MESSAGE_WARNING | GST_MESSAGE_EOS | GST_MESSAGE_ELEMENT);
+
+  GstMessage * msg;
+  while ((msg = gst_bus_timed_pop_filtered(bus_, 0, types)) != nullptr) {
+    handle_bus_message(msg);
+    gst_message_unref(msg);
+  }
+}
+
+void GSCamNode::impl::handle_bus_message(GstMessage * msg)
+{
+  switch (GST_MESSAGE_TYPE(msg)) {
+    case GST_MESSAGE_ERROR: {
+      GError * err = nullptr;
+      gchar * debug_info = nullptr;
+      gst_message_parse_error(msg, &err, &debug_info);
+      const gchar * src_name = GST_MESSAGE_SRC(msg) ?
+        GST_OBJECT_NAME(GST_MESSAGE_SRC(msg)) : "unknown";
+      RCLCPP_ERROR(
+        node_->get_logger(),
+        "GStreamer error from %s: %s",
+        src_name, err ? err->message : "unknown error");
+      if (debug_info) {
+        RCLCPP_ERROR(node_->get_logger(), "GStreamer debug info: %s", debug_info);
+      }
+      if (err) {
+        g_error_free(err);
+      }
+      if (debug_info) {
+        g_free(debug_info);
+      }
+      stop_signal_ = true;
+      break;
+    }
+    case GST_MESSAGE_WARNING: {
+      GError * err = nullptr;
+      gchar * debug_info = nullptr;
+      gst_message_parse_warning(msg, &err, &debug_info);
+      const gchar * src_name = GST_MESSAGE_SRC(msg) ?
+        GST_OBJECT_NAME(GST_MESSAGE_SRC(msg)) : "unknown";
+      RCLCPP_WARN(
+        node_->get_logger(),
+        "GStreamer warning from %s: %s",
+        src_name, err ? err->message : "unknown warning");
+      if (debug_info) {
+        RCLCPP_WARN(node_->get_logger(), "GStreamer debug info: %s", debug_info);
+      }
+      if (err) {
+        g_error_free(err);
+      }
+      if (debug_info) {
+        g_free(debug_info);
+      }
+      break;
+    }
+    case GST_MESSAGE_EOS:
+      RCLCPP_INFO(node_->get_logger(), "GStreamer end-of-stream");
+      stop_signal_ = true;
+      break;
+    case GST_MESSAGE_ELEMENT: {
+      const GstStructure * s = gst_message_get_structure(msg);
+      if (s) {
+        const gchar * name = gst_structure_get_name(s);
+        if (name && (
+            g_str_has_prefix(name, "GstRTSPSrcTimeout") ||
+            g_str_has_prefix(name, "GstUDPSrcTimeout") ||
+            g_str_has_prefix(name, "GstTCPTimeout")))
+        {
+          RCLCPP_ERROR(
+            node_->get_logger(), "GStreamer stream timeout (%s)", name);
+          stop_signal_ = true;
+        }
+      }
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+void GSCamNode::impl::mark_frame_received()
+{
+  got_first_frame_ = true;
+  last_frame_time_ = std::chrono::steady_clock::now();
+}
+
+bool GSCamNode::impl::check_stream_stall()
+{
+  if (cxt_.stream_timeout_sec_ <= 0.0) {
+    return false;
+  }
+  if (!got_first_frame_) {
+    return false;
+  }
+
+  const auto elapsed = std::chrono::steady_clock::now() - last_frame_time_;
+  if (elapsed > std::chrono::duration<double>(cxt_.stream_timeout_sec_)) {
+    RCLCPP_ERROR(
+      node_->get_logger(),
+      "No frames received for %.1f s, stream appears disconnected",
+      cxt_.stream_timeout_sec_);
+    return true;
+  }
+  return false;
+}
+
+bool GSCamNode::impl::wait_for_first_frame()
+{
+  const bool check_startup_deadline = cxt_.startup_timeout_sec_ > 0.0;
+  const auto deadline = std::chrono::steady_clock::now() +
+    std::chrono::duration<double>(cxt_.startup_timeout_sec_);
+
+  if (check_startup_deadline) {
+    RCLCPP_INFO(
+      node_->get_logger(),
+      "Waiting up to %.1f s for first frame...",
+      cxt_.startup_timeout_sec_);
+  } else {
+    RCLCPP_INFO(
+      node_->get_logger(),
+      "Waiting for first frame (startup timeout disabled)...");
+  }
+
+  while (!stop_signal_ && rclcpp::ok()) {
+    if (check_startup_deadline && std::chrono::steady_clock::now() >= deadline) {
+      break;
+    }
+    poll_bus();
+    if (stop_signal_) {
+      return false;
+    }
+
+    GstSample * sample = gst_app_sink_try_pull_sample(
+      GST_APP_SINK(sink_), 100 * GST_MSECOND);
+    if (sample) {
+      gst_sample_unref(sample);
+      mark_frame_received();
+      RCLCPP_INFO(node_->get_logger(), "First frame received, pipeline validated");
+      return true;
+    }
+  }
+
+  poll_bus();
+  if (stop_signal_ || !rclcpp::ok()) {
+    return false;
+  }
+  if (check_startup_deadline) {
+    RCLCPP_ERROR(
+      node_->get_logger(),
+      "No frames received within %.1f s. Check gscam_config and camera connectivity.",
+      cxt_.startup_timeout_sec_);
+  }
+  return false;
+}
+
 void GSCamNode::impl::delete_pipeline()
 {
+  if (bus_) {
+    gst_object_unref(bus_);
+    bus_ = nullptr;
+  }
+
   // Stop a running stream, or cleanup a stream that failed to fully start
   if (pipeline_) {
     gst_element_set_state(pipeline_, GST_STATE_NULL);
@@ -449,22 +643,30 @@ void GSCamNode::impl::process_frame()
   gst_memory_unmap(memory, &info);
   gst_memory_unref(memory);
   gst_sample_unref(sample);
+  mark_frame_received();
 }
 
 void GSCamNode::impl::shutdown()
 {
-  if (shutdown_signal_.exchange(true)) {
+  shutdown_signal_.store(true);
+  stop_signal_ = true;
+
+  // rclcpp::shutdown() from the pipeline thread runs this callback on the same
+  // thread; joining ourselves would deadlock ("Resource deadlock avoided").
+  const bool on_pipeline_thread =
+    pipeline_thread_.joinable() &&
+    pipeline_thread_.get_id() == std::this_thread::get_id();
+  if (on_pipeline_thread) {
     return;
   }
 
   if (pipeline_) {
-    stop_signal_ = true;
     gst_element_set_state(pipeline_, GST_STATE_NULL);
-    if (pipeline_thread_.joinable()) {
-      pipeline_thread_.join();
-    }
-    delete_pipeline();
   }
+  if (pipeline_thread_.joinable()) {
+    pipeline_thread_.join();
+  }
+  delete_pipeline();
 }
 
 void GSCamNode::impl::restart()
@@ -534,18 +736,38 @@ void GSCamNode::impl::restart()
 
         // reset skipping state when (re)starting
         skip_count_ = 0;
+        got_first_frame_ = false;
 
-        while (!stop_signal_ && rclcpp::ok()) {
-          process_frame();
+        if (!wait_for_first_frame()) {
+          stop_signal_ = true;
         }
 
+        while (!stop_signal_ && rclcpp::ok()) {
+          poll_bus();
+          if (check_stream_stall()) {
+            stop_signal_ = true;
+            break;
+          }
+          process_frame();
+          poll_bus();
+        }
+
+        const bool stream_failed = stop_signal_ && !shutdown_signal_;
         stop_signal_ = false;
-        if (!shutdown_signal_ && rclcpp::ok()) {
+
+        if (stream_failed && rclcpp::ok()) {
+          RCLCPP_ERROR(node_->get_logger(), "Stream failed, shutting down");
+          rclcpp::shutdown();
+        } else if (!shutdown_signal_ && rclcpp::ok()) {
           RCLCPP_INFO(node_->get_logger(), "Thread stopped");    // NOLINT
         }
       });
   } else {
     delete_pipeline();
+    if (!shutdown_signal_) {
+      RCLCPP_FATAL(node_->get_logger(), "Failed to create GStreamer pipeline");
+      rclcpp::shutdown();
+    }
   }
 }
 
@@ -574,6 +796,8 @@ GSCamNode::GSCamNode(const rclcpp::NodeOptions & options)
   pImpl_->cxt_.camera_name_ = declare_parameter("camera_name", "");
   pImpl_->cxt_.frame_id_ = declare_parameter("frame_id", "camera_frame");
   pImpl_->cxt_.skip_ = declare_parameter("skip", 0);
+  pImpl_->cxt_.startup_timeout_sec_ = declare_parameter("startup_timeout_sec", 0.0);
+  pImpl_->cxt_.stream_timeout_sec_ = declare_parameter("stream_timeout_sec", 0.0);
 
   validate_parameters();
 
@@ -616,6 +840,12 @@ GSCamNode::GSCamNode(const rclcpp::NodeOptions & options)
         } else if (parameter.get_name() == "skip") {
           pImpl_->cxt_.skip_ = parameter.as_int();
           param_set = true;
+        } else if (parameter.get_name() == "startup_timeout_sec") {
+          pImpl_->cxt_.startup_timeout_sec_ = parameter.as_double();
+          param_set = true;
+        } else if (parameter.get_name() == "stream_timeout_sec") {
+          pImpl_->cxt_.stream_timeout_sec_ = parameter.as_double();
+          param_set = true;
         }
 
         if (param_set) {
@@ -653,7 +883,8 @@ void GSCamNode::validate_parameters()
   RCLCPP_INFO(get_logger(), "camera_name = %s", pImpl_->cxt_.camera_name_.c_str());
   RCLCPP_INFO(get_logger(), "frame_id = %s", pImpl_->cxt_.frame_id_.c_str());
   RCLCPP_INFO(get_logger(), "skip = %ld", pImpl_->cxt_.skip_);
-
+  RCLCPP_INFO(get_logger(), "startup_timeout_sec = %.1f", pImpl_->cxt_.startup_timeout_sec_);
+  RCLCPP_INFO(get_logger(), "stream_timeout_sec = %.1f", pImpl_->cxt_.stream_timeout_sec_);
   pImpl_->restart();
 }
 
