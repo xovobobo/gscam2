@@ -103,6 +103,7 @@ ros2 run gscam2 gscam_main  --ros-args -p gst_plugin_path:="/home/me/myplugins"
 | `sync_sink` | bool | True | Enable GstBaseSink synchronization |
 | `preroll` | bool | False | Transition to GST_STATE_PLAYING twice |
 | `use_gst_timestamps` | bool | False | Use gst time instead of ROS time |
+| `respawn` | bool | False | Retry pipeline startup and stream failures instead of shutting down |
 | `image_encoding` | string | `sensor_msgs::image_encodings::RGB8` |  ROS image encoding |
 | `camera_info_url` | string | | URL to camera info file, e.g., `file:///path/to/file` |
 | `camera_name` | string | | Replaces `${NAME}` in the URL  |

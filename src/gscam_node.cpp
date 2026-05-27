@@ -28,6 +28,7 @@ struct GSCamContext
   bool sync_sink_{};              // Sync to the clock
   bool preroll_{};                // Pre-fill buffers
   bool use_gst_timestamps_{};     // Use gst time instead of ROS time
+  bool respawn_{};                // Retry after pipeline startup or stream failure
   std::string image_encoding_;    // Image encoding
   std::string camera_info_url_;   // Location of the camera info file
   std::string camera_name_;       // Camera name
@@ -100,6 +101,7 @@ class GSCamNode::impl
   void handle_bus_message(GstMessage * msg);
   bool wait_for_first_frame();
   bool check_stream_stall();
+  bool sleep_before_respawn();
   void mark_frame_received();
 
 public:
@@ -162,8 +164,17 @@ bool GSCamNode::impl::create_pipeline()
   GError * error = nullptr;
   pipeline_ = gst_parse_launch(cxt_.gscam_config_.c_str(), &error);
   if (!pipeline_) {
-    RCLCPP_FATAL(node_->get_logger(), "%s", error->message);
+    RCLCPP_FATAL(
+      node_->get_logger(), "%s",
+      error ? error->message : "unknown GStreamer parse error");
+    if (error) {
+      g_error_free(error);
+    }
     return false;
+  }
+  if (error) {
+    RCLCPP_WARN(node_->get_logger(), "%s", error->message);
+    g_error_free(error);
   }
 
   // Create RGB sink
@@ -428,6 +439,18 @@ void GSCamNode::impl::mark_frame_received()
   last_frame_time_ = std::chrono::steady_clock::now();
 }
 
+bool GSCamNode::impl::sleep_before_respawn()
+{
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!stop_signal_ && !shutdown_signal_ && rclcpp::ok() &&
+    std::chrono::steady_clock::now() < deadline)
+  {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+
+  return !stop_signal_ && !shutdown_signal_ && rclcpp::ok();
+}
+
 bool GSCamNode::impl::check_stream_stall()
 {
   if (cxt_.stream_timeout_sec_ <= 0.0) {
@@ -509,6 +532,7 @@ void GSCamNode::impl::delete_pipeline()
     gst_element_set_state(pipeline_, GST_STATE_NULL);
     gst_object_unref(pipeline_);
     pipeline_ = nullptr;
+    sink_ = nullptr;
     if (!shutdown_signal_ && rclcpp::ok()) {
       RCLCPP_INFO(node_->get_logger(), "Pipeline deleted");
     }
@@ -675,10 +699,12 @@ void GSCamNode::impl::shutdown()
 
 void GSCamNode::impl::restart()
 {
-  if (pipeline_) {
+  if (pipeline_thread_.joinable() || pipeline_) {
     // Stop thread
     stop_signal_ = true;
-    gst_element_set_state(pipeline_, GST_STATE_NULL);
+    if (pipeline_) {
+      gst_element_set_state(pipeline_, GST_STATE_NULL);
+    }
     if (pipeline_thread_.joinable()) {
       pipeline_thread_.join();
     }
@@ -686,6 +712,12 @@ void GSCamNode::impl::restart()
     // Delete pipeline
     delete_pipeline();
   }
+
+  if (shutdown_signal_) {
+    return;
+  }
+
+  stop_signal_ = false;
 
   // If gscam_config is empty look for GSCAM_CONFIG in the environment
   if (cxt_.gscam_config_.empty()) {
@@ -730,12 +762,33 @@ void GSCamNode::impl::restart()
   }
 
   // [Re-]start the pipeline in its own thread
-  if (create_pipeline()) {
-    pipeline_thread_ = std::thread(
-      [this]()
-      {
+  pipeline_thread_ = std::thread(
+    [this]()
+    {
+      while (!shutdown_signal_ && rclcpp::ok()) {
+        stop_signal_ = false;
+
         if (!shutdown_signal_ && rclcpp::ok()) {
           RCLCPP_INFO(node_->get_logger(), "Thread running");    // NOLINT
+        }
+
+        if (!create_pipeline()) {
+          delete_pipeline();
+          if (!cxt_.respawn_) {
+            if (!shutdown_signal_ && rclcpp::ok()) {
+              RCLCPP_FATAL(node_->get_logger(), "Failed to create GStreamer pipeline");
+              rclcpp::shutdown();
+            }
+            break;
+          }
+          if (shutdown_signal_ || !rclcpp::ok()) {
+            break;
+          }
+          RCLCPP_ERROR(node_->get_logger(), "Failed to create GStreamer pipeline, respawning");
+          if (!sleep_before_respawn()) {
+            break;
+          }
+          continue;
         }
 
         // reset skipping state when (re)starting
@@ -758,21 +811,27 @@ void GSCamNode::impl::restart()
 
         const bool stream_failed = stop_signal_ && !shutdown_signal_;
         stop_signal_ = false;
+        delete_pipeline();
 
-        if (stream_failed && rclcpp::ok()) {
+        if (!stream_failed || shutdown_signal_ || !rclcpp::ok()) {
+          if (!shutdown_signal_ && rclcpp::ok()) {
+            RCLCPP_INFO(node_->get_logger(), "Thread stopped");    // NOLINT
+          }
+          break;
+        }
+
+        if (!cxt_.respawn_) {
           RCLCPP_ERROR(node_->get_logger(), "Stream failed, shutting down");
           rclcpp::shutdown();
-        } else if (!shutdown_signal_ && rclcpp::ok()) {
-          RCLCPP_INFO(node_->get_logger(), "Thread stopped");    // NOLINT
+          break;
         }
-      });
-  } else {
-    delete_pipeline();
-    if (!shutdown_signal_) {
-      RCLCPP_FATAL(node_->get_logger(), "Failed to create GStreamer pipeline");
-      rclcpp::shutdown();
-    }
-  }
+
+        RCLCPP_ERROR(node_->get_logger(), "Stream failed, respawning");
+        if (!sleep_before_respawn()) {
+          break;
+        }
+      }
+    });
 }
 
 //=============================================================================
@@ -793,6 +852,7 @@ GSCamNode::GSCamNode(const rclcpp::NodeOptions & options)
   pImpl_->cxt_.sync_sink_ = declare_parameter("sync_sink", true);
   pImpl_->cxt_.preroll_ = declare_parameter("preroll", false);
   pImpl_->cxt_.use_gst_timestamps_ = declare_parameter("use_gst_timestamps", false);
+  pImpl_->cxt_.respawn_ = declare_parameter("respawn", false);
   pImpl_->cxt_.image_encoding_ = declare_parameter(
     "image_encoding",
     sensor_msgs::image_encodings::RGB8);
@@ -828,6 +888,9 @@ GSCamNode::GSCamNode(const rclcpp::NodeOptions & options)
           param_set = true;
         } else if (parameter.get_name() == "use_gst_timestamps") {
           pImpl_->cxt_.use_gst_timestamps_ = parameter.as_bool();
+          param_set = true;
+        } else if (parameter.get_name() == "respawn") {
+          pImpl_->cxt_.respawn_ = parameter.as_bool();
           param_set = true;
         } else if (parameter.get_name() == "image_encoding") {
           pImpl_->cxt_.image_encoding_ = parameter.as_string();
@@ -882,6 +945,7 @@ void GSCamNode::validate_parameters()
   RCLCPP_INFO(
     get_logger(), "use_gst_timestamps = %s",
     pImpl_->cxt_.use_gst_timestamps_ ? "true" : "false");
+  RCLCPP_INFO(get_logger(), "respawn = %s", pImpl_->cxt_.respawn_ ? "true" : "false");
   RCLCPP_INFO(get_logger(), "image_encoding = %s", pImpl_->cxt_.image_encoding_.c_str());
   RCLCPP_INFO(get_logger(), "camera_info_url = %s", pImpl_->cxt_.camera_info_url_.c_str());
   RCLCPP_INFO(get_logger(), "camera_name = %s", pImpl_->cxt_.camera_name_.c_str());
