@@ -27,6 +27,8 @@ pkg_check_modules(GST_APP REQUIRED gstreamer-app-1.0 IMPORTED_TARGET)
 find_package(ament_cmake REQUIRED)
 find_package(camera_calibration_parsers REQUIRED)
 find_package(camera_info_manager REQUIRED)
+find_package(cv_bridge REQUIRED)
+find_package(image_transport REQUIRED)
 find_package(class_loader REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
@@ -58,6 +60,8 @@ target_link_libraries(gscam_node
   PRIVATE
     camera_calibration_parsers::camera_calibration_parsers
     camera_info_manager::camera_info_manager
+    cv_bridge::cv_bridge
+    image_transport::image_transport
     class_loader::class_loader
     rclcpp_components::component
     sensor_msgs::sensor_msgs_library

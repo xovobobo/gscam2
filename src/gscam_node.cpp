@@ -9,9 +9,12 @@ extern "C" {
 #include <chrono>
 #include <thread>
 
+#include <cv_bridge/cv_bridge.h>
+#include <opencv2/imgcodecs.hpp>
+
 #include "camera_info_manager/camera_info_manager.hpp"
+#include "image_transport/image_transport.hpp"
 #include "sensor_msgs/image_encodings.hpp"
-#include "sensor_msgs/msg/compressed_image.hpp"
 #include "sensor_msgs/msg/image.hpp"
 
 namespace gscam2
@@ -79,14 +82,8 @@ class GSCamNode::impl
   bool got_first_frame_{false};
   std::chrono::steady_clock::time_point last_frame_time_{};
 
-  // Publish images...
-  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr camera_pub_;
-
-  // ... or compressed images
-  rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr jpeg_pub_;
-
-  // Publish camera info
-  rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr cinfo_pub_;
+  // Publish images and camera info via image_transport
+  image_transport::CameraPublisher camera_pub_;
 
   // Create gstreamer pipeline, return true if successful
   bool create_pipeline();
@@ -301,17 +298,9 @@ bool GSCamNode::impl::create_pipeline()
     RCLCPP_INFO(node_->get_logger(), "Stream is paused");
   }
 
-  auto qos_options = rclcpp::PublisherOptions();
-  qos_options.qos_overriding_options = rclcpp::QosOverridingOptions::with_default_policies();
   auto qos = rclcpp::QoS(1);
-
-  cinfo_pub_ = node_->create_publisher<sensor_msgs::msg::CameraInfo>("camera_info", qos, qos_options);
-  if (cxt_.image_encoding_ == "jpeg") {
-    jpeg_pub_ =
-      node_->create_publisher<sensor_msgs::msg::CompressedImage>("image_raw/compressed", qos, qos_options);
-  } else {
-    camera_pub_ = node_->create_publisher<sensor_msgs::msg::Image>("image_raw", qos, qos_options);
-  }
+  camera_pub_ = image_transport::create_camera_publisher(
+    node_, "image_raw", qos.get_rmw_qos_profile());
 
   // Pre-roll camera if needed
   if (cxt_.preroll_) {
@@ -616,13 +605,19 @@ void GSCamNode::impl::process_frame()
   // RCLCPP_INFO(get_logger(), "Image time stamp: %.3f",cinfo->header.stamp.toSec());
   cinfo->header.frame_id = cxt_.frame_id_;
   if (cxt_.image_encoding_ == "jpeg") {
-    auto img = std::make_unique<sensor_msgs::msg::CompressedImage>();
-    img->header = cinfo->header;
-    img->format = "jpeg";
-    img->data.resize(buf_size);
-    std::copy(buf_data, (buf_data) + (buf_size), img->data.begin());
-    jpeg_pub_->publish(std::move(img));
-    cinfo_pub_->publish(std::move(cinfo));
+    const cv::Mat jpeg_mat(1, static_cast<int>(buf_size), CV_8UC1, buf_data);
+    const cv::Mat bgr = cv::imdecode(jpeg_mat, cv::IMREAD_COLOR);
+    if (bgr.empty()) {
+      RCLCPP_WARN(node_->get_logger(), "Failed to decode JPEG frame");
+      gst_memory_unmap(memory, &info);
+      gst_memory_unref(memory);
+      gst_sample_unref(sample);
+      return;
+    }
+
+    const cv_bridge::CvImage cv_img(cinfo->header, sensor_msgs::image_encodings::BGR8, bgr);
+    const sensor_msgs::msg::Image img = *cv_img.toImageMsg();
+    camera_pub_.publish(img, *cinfo);
   } else {
     // Complain if the returned buffer is smaller than we expect
     const unsigned int expected_frame_size = width_ * height_ *
@@ -663,8 +658,7 @@ void GSCamNode::impl::process_frame()
 #endif
 
     // Publish the image/info
-    camera_pub_->publish(std::move(img));
-    cinfo_pub_->publish(std::move(cinfo));
+    camera_pub_.publish(*img, *cinfo);
   }
 
   // Release the buffer
