@@ -410,9 +410,22 @@ void GSCamNode::impl::handle_bus_message(GstMessage * msg)
             g_str_has_prefix(name, "GstUDPSrcTimeout") ||
             g_str_has_prefix(name, "GstTCPTimeout")))
         {
-          RCLCPP_ERROR(
-            node_->get_logger(), "GStreamer stream timeout (%s)", name);
-          stop_signal_ = true;
+          if (cxt_.stream_timeout_sec_ <= 0.0) {
+            RCLCPP_WARN(
+              node_->get_logger(),
+              "GStreamer stream timeout (%s), ignored (stream_timeout_sec disabled)", name);
+          } else if (check_stream_stall()) {
+            RCLCPP_ERROR(
+              node_->get_logger(),
+              "GStreamer stream timeout (%s), no frames for %.1f s",
+              name, cxt_.stream_timeout_sec_);
+            stop_signal_ = true;
+          } else {
+            RCLCPP_WARN(
+              node_->get_logger(),
+              "GStreamer stream timeout (%s), frames still within %.1f s window, ignoring",
+              name, cxt_.stream_timeout_sec_);
+          }
         }
       }
       break;
