@@ -39,6 +39,7 @@ struct GSCamContext
   int64_t skip_{};                // Skip n frames, then send 1
   double startup_timeout_sec_{};  // Max wait for first frame; 0 = wait indefinitely
   double stream_timeout_sec_{};   // Max gap between frames; 0 = disable stall check
+  bool lazy_{};                   // Run the pipeline only while image_raw/camera_info have subscribers
 
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr
     on_set_parameters_callback_handle_;
@@ -100,6 +101,8 @@ class GSCamNode::impl
   bool check_stream_stall();
   bool sleep_before_respawn();
   void mark_frame_received();
+  bool no_subscribers();
+  bool wait_for_subscribers();
 
 public:
   // Parameters
@@ -298,10 +301,6 @@ bool GSCamNode::impl::create_pipeline()
     RCLCPP_INFO(node_->get_logger(), "Stream is paused");
   }
 
-  auto qos = rclcpp::QoS(1);
-  camera_pub_ = image_transport::create_camera_publisher(
-    node_, "image_raw", qos.get_rmw_qos_profile());
-
   // Pre-roll camera if needed
   if (cxt_.preroll_) {
     // The PAUSE, PLAY, PAUSE, PLAY cycle is to ensure proper pre-roll
@@ -441,6 +440,28 @@ void GSCamNode::impl::mark_frame_received()
   last_frame_time_ = std::chrono::steady_clock::now();
 }
 
+bool GSCamNode::impl::no_subscribers()
+{
+  // CameraPublisher: max of image_raw (all transports) and camera_info subscribers
+  return cxt_.lazy_ && camera_pub_.getNumSubscribers() == 0;
+}
+
+bool GSCamNode::impl::wait_for_subscribers()
+{
+  if (!no_subscribers()) {
+    return true;
+  }
+  RCLCPP_INFO(node_->get_logger(), "lazy: no subscribers, pipeline not started");
+  while (!shutdown_signal_ && rclcpp::ok() && no_subscribers()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  if (shutdown_signal_ || !rclcpp::ok()) {
+    return false;
+  }
+  RCLCPP_INFO(node_->get_logger(), "lazy: subscriber appeared, starting pipeline");
+  return true;
+}
+
 bool GSCamNode::impl::sleep_before_respawn()
 {
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
@@ -495,7 +516,7 @@ bool GSCamNode::impl::wait_for_first_frame()
       break;
     }
     poll_bus();
-    if (stop_signal_) {
+    if (stop_signal_ || no_subscribers()) {
       return false;
     }
 
@@ -756,6 +777,13 @@ void GSCamNode::impl::restart()
     return;
   }
 
+  // Created once (not per pipeline): with lazy the subscribers are counted before the pipeline exists
+  if (!camera_pub_) {
+    auto qos = rclcpp::QoS(1);
+    camera_pub_ = image_transport::create_camera_publisher(
+      node_, "image_raw", qos.get_rmw_qos_profile());
+  }
+
   camera_info_manager_.setCameraName(cxt_.camera_name_);
 
   if (camera_info_manager_.validateURL(cxt_.camera_info_url_)) {
@@ -777,6 +805,10 @@ void GSCamNode::impl::restart()
 
         if (!shutdown_signal_ && rclcpp::ok()) {
           RCLCPP_INFO(node_->get_logger(), "Thread running");    // NOLINT
+        }
+
+        if (!wait_for_subscribers()) {
+          break;
         }
 
         if (!create_pipeline()) {
@@ -808,7 +840,7 @@ void GSCamNode::impl::restart()
 
         while (!stop_signal_ && rclcpp::ok()) {
           poll_bus();
-          if (check_stream_stall()) {
+          if (check_stream_stall() || no_subscribers()) {
             stop_signal_ = true;
             break;
           }
@@ -819,6 +851,12 @@ void GSCamNode::impl::restart()
         const bool stream_failed = stop_signal_ && !shutdown_signal_;
         stop_signal_ = false;
         delete_pipeline();
+
+        // lazy: subscribers gone (also during startup or after a failure) – wait for them, no respawn delay
+        if (!shutdown_signal_ && rclcpp::ok() && no_subscribers()) {
+          RCLCPP_INFO(node_->get_logger(), "lazy: no subscribers, pipeline stopped");
+          continue;
+        }
 
         if (!stream_failed || shutdown_signal_ || !rclcpp::ok()) {
           if (!shutdown_signal_ && rclcpp::ok()) {
@@ -869,6 +907,7 @@ GSCamNode::GSCamNode(const rclcpp::NodeOptions & options)
   pImpl_->cxt_.skip_ = declare_parameter("skip", 0);
   pImpl_->cxt_.startup_timeout_sec_ = declare_parameter("startup_timeout_sec", 0.0);
   pImpl_->cxt_.stream_timeout_sec_ = declare_parameter("stream_timeout_sec", 0.0);
+  pImpl_->cxt_.lazy_ = declare_parameter("lazy", false);
 
   validate_parameters();
 
@@ -920,6 +959,9 @@ GSCamNode::GSCamNode(const rclcpp::NodeOptions & options)
         } else if (parameter.get_name() == "stream_timeout_sec") {
           pImpl_->cxt_.stream_timeout_sec_ = parameter.as_double();
           param_set = true;
+        } else if (parameter.get_name() == "lazy") {
+          pImpl_->cxt_.lazy_ = parameter.as_bool();
+          param_set = true;
         }
 
         if (param_set) {
@@ -960,6 +1002,7 @@ void GSCamNode::validate_parameters()
   RCLCPP_INFO(get_logger(), "skip = %ld", pImpl_->cxt_.skip_);
   RCLCPP_INFO(get_logger(), "startup_timeout_sec = %.1f", pImpl_->cxt_.startup_timeout_sec_);
   RCLCPP_INFO(get_logger(), "stream_timeout_sec = %.1f", pImpl_->cxt_.stream_timeout_sec_);
+  RCLCPP_INFO(get_logger(), "lazy = %s", pImpl_->cxt_.lazy_ ? "true" : "false");
   pImpl_->restart();
 }
 

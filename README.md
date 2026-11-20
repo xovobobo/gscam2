@@ -111,6 +111,7 @@ ros2 run gscam2 gscam_main  --ros-args -p gst_plugin_path:="/home/me/myplugins"
 | `skip` | int | 0 | Skip n frames for each frame sent; useful for reducing frame rates |
 | `startup_timeout_sec` | double | 0.0 | Maximum time to wait (in seconds) for the first frame during startup; 0.0 means infinite |
 | `stream_timeout_sec_` | double | 0.0 | Timeout (in seconds) between frames before exiting; 0.0 means disabled |
+| `lazy` | bool | False | Run the pipeline only while `image_raw` (any transport) or `camera_info` has subscribers; stop it when the last one leaves |
 
 ## Topics
 - `camera_info`
