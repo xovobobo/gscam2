@@ -9,7 +9,7 @@ extern "C" {
 #include <chrono>
 #include <thread>
 
-#include <cv_bridge/cv_bridge.h>
+#include <cv_bridge/cv_bridge.hpp>
 #include <opencv2/imgcodecs.hpp>
 
 #include "camera_info_manager/camera_info_manager.hpp"
